@@ -16,6 +16,11 @@ agente-sdr/agente-whatsapp (referência externa).
   um exemplo de implementação HTTP com retry exponencial.
 - **`agente.ts`** — esqueleto do loop principal, já ligando anti-loop, debounce, controle de IA,
   cache de prompt e extração de registro do core.
+- **Grupo de WhatsApp** (`receberMensagemDeGrupo` em `agente.ts`, sobre o `grupo-contexto` do
+  core) — o agente só responde quando é marcado (nome, @menção, resposta a ele ou comando `/`),
+  mas toda mensagem do grupo fica registrada; quando marcado, ele recebe tudo o que foi dito
+  desde a última leitura dele (inclusive as próprias respostas) e responde no contexto. O grupo
+  compartilha uma sessão e um estado SPICED. Preencha `NOMES_DO_AGENTE` e `IDS_DO_AGENTE`.
 
 ## O que é TODO de propósito
 

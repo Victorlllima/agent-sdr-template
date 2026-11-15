@@ -9,15 +9,20 @@
  *    Evolution, Uzapi, Cloud API oficial nem nenhum provedor específico.
  *  - Trocar CrmConsole por um CrmAdapter real.
  *  - Trocar MemoriaEmProcesso por um SessionStore persistente.
+ *  - Em grupo: troque DiarioGrupoEmProcesso por persistência real e preencha
+ *    NOMES_DO_AGENTE / IDS_DO_AGENTE (ver receberMensagemDeGrupo).
  */
 
 import Anthropic from "@anthropic-ai/sdk";
 import {
   AntiLoop,
+  ContextoGrupo,
   DebounceConversa,
+  DiarioGrupoEmProcesso,
   IaControl,
   MemoriaEmProcesso,
   deveFicarEmSilencio,
+  deveResponder,
   extrairRegistros,
   fundirEstado,
   montarSystemCacheado,
@@ -39,7 +44,24 @@ const memoria = new MemoriaEmProcesso();
 const crm = new CrmConsole();
 const estadosPorConversa = new Map<string, EstadoLead>();
 
-async function processarMensagem(lead: Lead, messageId: string, texto: string): Promise<string | null> {
+// Grupo: responde só quando marcado, mas lê tudo desde a última leitura.
+// TODO: troque por persistência real (tabela por tenant+grupo, ou JSONL).
+const contextoGrupo = new ContextoGrupo(new DiarioGrupoEmProcesso());
+// TODO: nome(s) pelo qual o grupo chama o agente e os ids dele no canal (JID/LID).
+const NOMES_DO_AGENTE: (string | RegExp)[] = ["Assistente"];
+const IDS_DO_AGENTE: string[] = [];
+
+/**
+ * @param contextoExtra bloco que o modelo vê junto da mensagem neste turno
+ *   (ex.: o diff do grupo), mas que NÃO vai para o histórico salvo — senão o
+ *   histórico repete a conversa do grupo a cada menção.
+ */
+async function processarMensagem(
+  lead: Lead,
+  messageId: string,
+  texto: string,
+  contextoExtra?: string,
+): Promise<string | null> {
   const decisao = antiLoop.avaliar(lead.telefone, messageId);
   if (!decisao.aceitar) return null;
 
@@ -59,7 +81,10 @@ async function processarMensagem(lead: Lead, messageId: string, texto: string): 
     model: "claude-opus-5-5",
     max_tokens: 1024,
     system,
-    messages: [...historico, { role: "user", content: texto }],
+    messages: [
+      ...historico,
+      { role: "user", content: contextoExtra ? `${contextoExtra}\n\n[Mensagem que te acionou]\n${texto}` : texto },
+    ],
   });
 
   const textoResposta = resposta.content
@@ -82,6 +107,54 @@ async function processarMensagem(lead: Lead, messageId: string, texto: string): 
   return textoFinal;
 }
 
+export interface MensagemDeGrupoRecebida {
+  grupoId: string;
+  messageId: string;
+  /** Texto, ou a transcrição do áudio. */
+  texto: string;
+  /** JIDs marcados com @ na mensagem. */
+  mencionados?: string[];
+  /** true se é resposta (citação) a uma mensagem do agente. */
+  respondendoAoAgente?: boolean;
+  midia?: string;
+  citando?: string;
+}
+
+/**
+ * Chame para TODA mensagem que chegar num grupo — não só as que marcam o
+ * agente. Todas entram no diário; só as que chamam o agente geram resposta,
+ * e essa resposta vê tudo o que foi dito desde a última leitura.
+ *
+ * O grupo inteiro compartilha uma sessão e um estado SPICED (conversaId =
+ * grupoId): ex. grupo de compra com sócios, onde a decisão é coletiva.
+ */
+async function receberMensagemDeGrupo(lead: Lead, msg: MensagemDeGrupoRecebida): Promise<string | null> {
+  const chave = { tenantId: lead.tenantId, grupoId: msg.grupoId };
+  await contextoGrupo.registrar(chave, {
+    id: msg.messageId,
+    autor: lead.nome ?? lead.telefone,
+    texto: msg.texto,
+    midia: msg.midia,
+    citando: msg.citando,
+  });
+
+  const chamado = deveResponder({
+    texto: msg.texto,
+    mencionados: msg.mencionados,
+    idsAgente: IDS_DO_AGENTE,
+    respondendoAoAgente: msg.respondendoAoAgente,
+    padroes: NOMES_DO_AGENTE,
+  });
+  if (!chamado) return null;
+
+  const leitura = await contextoGrupo.lerDesdeUltimaLeitura(chave);
+  const resposta = await processarMensagem({ ...lead, conversaId: msg.grupoId }, msg.messageId, msg.texto, leitura.contexto);
+
+  // O agente precisa ver o que ele mesmo já disse na próxima leitura.
+  if (resposta) await contextoGrupo.registrar(chave, { autor: "agente", texto: resposta, doAgente: true });
+  return resposta;
+}
+
 // TODO: substitua por um webhook real (Express/Fastify) recebendo eventos do
 // provedor de WhatsApp. Este debounce é só pra ilustrar a ligação com o core.
 const debounce = new DebounceConversa(async (conversaId: string, mensagemJunta: string) => {
@@ -90,4 +163,4 @@ const debounce = new DebounceConversa(async (conversaId: string, mensagemJunta: 
   // TODO: enviar `resposta` de volta pelo provedor de WhatsApp.
 });
 
-export { processarMensagem, debounce };
+export { processarMensagem, receberMensagemDeGrupo, debounce };
